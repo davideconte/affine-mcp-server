@@ -3274,6 +3274,43 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
   }, updateDocTitleHandler as any);
 
+  // ─── search_docs ─────────────────────────────────────────────────────────────
+  // Fast title search via workspace metadata snapshot (O(1) single socket connection)
+  const searchDocsHandler = async (parsed: { workspaceId?: string; query: string; limit?: number }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
+      if (!wsSnap.missing) return text({ query: parsed.query, totalCount: 0, results: [] });
+      const wsDoc = new Y.Doc();
+      Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
+      const q = parsed.query.toLowerCase();
+      const limit = parsed.limit ?? 20;
+      const matches = getWorkspacePageEntries(wsDoc.getMap("meta"))
+        .filter(p => p.title && p.title.toLowerCase().includes(q))
+        .slice(0, limit)
+        .map(p => ({
+          docId: p.id,
+          title: p.title,
+          url: `${(process.env.AFFINE_BASE_URL || "").replace(/\/$/, "")}/workspace/${workspaceId}/${p.id}`,
+        }));
+      return text({ query: parsed.query, totalCount: matches.length, results: matches });
+    } finally { socket.disconnect(); }
+  };
+  server.registerTool("search_docs", {
+    title: "Search Documents by Title",
+    description: "Fast title search across all workspace docs using metadata snapshot. Returns docId, title, and URL. Use get_doc_by_title to also retrieve content.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      query: z.string().describe("Title search query (case-insensitive substring match)."),
+      limit: z.number().optional().describe("Max results to return (default: 20)."),
+    },
+  }, searchDocsHandler as any);
+
   // ─── get_doc_by_title ────────────────────────────────────────────────────────
   const getDocByTitleHandler = async (parsed: { workspaceId?: string; query: string; limit?: number }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
