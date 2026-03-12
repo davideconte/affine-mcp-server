@@ -1385,9 +1385,28 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           }
         }
 
-        block.set("prop:rows", rows);
-        block.set("prop:columns", columns);
-        block.set("prop:cells", cells);
+        // Flat dot-notation keys — AFFiNE frontend reads Object.entries(block.toJSON())
+        // filtering by key prefix, so nested Y.Maps are invisible. Use flat keys instead.
+        for (const [rowId, rowData] of Object.entries(rows)) {
+          block.set(`prop:rows.${rowId}.rowId`, rowData.rowId);
+          block.set(`prop:rows.${rowId}.order`, rowData.order);
+          if (rowData.backgroundColor) block.set(`prop:rows.${rowId}.backgroundColor`, rowData.backgroundColor);
+        }
+        for (const [columnId, colData] of Object.entries(columns)) {
+          block.set(`prop:columns.${columnId}.columnId`, colData.columnId);
+          block.set(`prop:columns.${columnId}.order`, colData.order);
+          if (colData.width !== undefined) block.set(`prop:columns.${columnId}.width`, colData.width);
+        }
+        for (const [cellKey, cellData] of Object.entries(cells)) {
+          const cellYText = new Y.Text();
+          const rowIndex = rowIds.indexOf(cellKey.split(":")[0]);
+          if (rowIndex === 0) {
+            cellYText.insert(0, cellData.text, { bold: true } as Record<string, unknown>);
+          } else {
+            cellYText.insert(0, cellData.text);
+          }
+          block.set(`prop:cells.${cellKey}.text`, cellYText);
+        }
         block.set("prop:comments", undefined);
         block.set("prop:textAlign", undefined);
         return { blockId, block, flavour: "affine:table" };
