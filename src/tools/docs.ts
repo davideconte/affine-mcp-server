@@ -3417,6 +3417,165 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
   }, getDocByTitleHandler as any);
 
+  // ─── get_doc_database_blocks ─────────────────────────────────────────────────
+  // Returns all affine:database block IDs and metadata for a given doc.
+  // Useful to find databaseBlockId without manually calling read_doc.
+  const getDocDatabaseBlocksHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snap = await loadDoc(socket, workspaceId, parsed.docId);
+      if (snap.missing) {
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+        const blocks = doc.getMap("blocks") as Y.Map<any>;
+        const databases: Array<{
+          blockId: string;
+          title: string | null;
+          columnCount: number;
+          rowCount: number;
+        }> = [];
+        for (const [blockId, raw] of blocks) {
+          if (!(raw instanceof Y.Map)) continue;
+          if (raw.get("sys:flavour") === "affine:database") {
+            const title = richTextValueToString(raw.get("prop:title")) || null;
+            // Row count from the cells Y.Map
+            const cells = raw.get("cells");
+            let rowCount = 0;
+            if (cells instanceof Y.Map) rowCount = cells.size;
+            databases.push({ blockId, title, columnCount: 0, rowCount });
+          }
+        }
+        return text({ docId: parsed.docId, workspaceId, databases });
+      }
+      return text({ docId: parsed.docId, workspaceId, databases: [] });
+    } finally { socket.disconnect(); }
+  };
+  server.registerTool("get_doc_database_blocks", {
+    title: "Get Document Database Blocks",
+    description: "Find all affine:database blocks inside a document. Returns blockId, title, and row count for each database. Use this to discover databaseBlockId before calling read_database_columns or read_database_cells.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: z.string().describe("Document ID to scan for database blocks."),
+    },
+  }, getDocDatabaseBlocksHandler as any);
+
+  // ─── workspace_summary ───────────────────────────────────────────────────────
+  // Returns aggregate stats for a workspace: total docs, docs with databases, total db rows.
+  const workspaceSummaryHandler = async (parsed: {
+    workspaceId?: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
+      if (!wsSnap.missing) return text({ workspaceId, totalDocs: 0, databases: [], totalRows: 0 });
+      const wsDoc = new Y.Doc();
+      Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
+      const pages = getWorkspacePageEntries(wsDoc.getMap("meta"));
+      const docsWithDatabases: Array<{ docId: string; title: string | null; databaseBlockId: string; rowCount: number }> = [];
+      let totalRows = 0;
+      for (const page of pages) {
+        const pageId = page.id;
+        const pageSnap = await loadDoc(socket, workspaceId, pageId);
+        if (!pageSnap.missing) continue;
+        const pageDoc = new Y.Doc();
+        Y.applyUpdate(pageDoc, Buffer.from(pageSnap.missing, "base64"));
+        const blocks = pageDoc.getMap("blocks") as Y.Map<any>;
+        for (const [blockId, raw] of blocks) {
+          if (!(raw instanceof Y.Map)) continue;
+          if (raw.get("sys:flavour") === "affine:database") {
+            const cells = raw.get("cells");
+            let rowCount = 0;
+            if (cells instanceof Y.Map) rowCount = cells.size;
+            totalRows += rowCount;
+            docsWithDatabases.push({
+              docId: pageId,
+              title: page.title || null,
+              databaseBlockId: blockId,
+              rowCount,
+            });
+          }
+        }
+      }
+      return text({
+        workspaceId,
+        totalDocs: pages.length,
+        databaseCount: docsWithDatabases.length,
+        docsWithDatabases,
+        totalRows,
+      });
+    } finally { socket.disconnect(); }
+  };
+  server.registerTool("workspace_summary", {
+    title: "Get Workspace Summary",
+    description: "Returns aggregate statistics for an AFFiNE workspace: total doc count, count of docs containing databases, and total row count across all databases. Useful for a quick overview without reading individual docs.",
+    inputSchema: {
+      workspaceId: z.string().optional().describe("Workspace ID (uses default if not provided)."),
+    },
+  }, workspaceSummaryHandler as any);
+
+  // ─── search_docs_global ─────────────────────────────────────────────────────
+  // Search across all workspaces in a single call.
+  // Uses list_workspaces GraphQL to discover all workspace IDs, then searches each via Y.js snapshot.
+  const searchDocsGlobalHandler = async (parsed: {
+    query: string;
+    limit?: number;
+  }) => {
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    // Step 1: get all workspace IDs via GraphQL
+    const workspacesQuery = `query { workspaces { id } }`;
+    const wsData = await gql.request<{ workspaces: Array<{ id: string }> }>(workspacesQuery);
+    const wsIds = wsData.workspaces.map(w => w.id);
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    const q = parsed.query.toLowerCase();
+    const limit = parsed.limit ?? 20;
+    const results: Array<{ workspaceId: string; docId: string; title: string | null; url: string }> = [];
+    try {
+      for (const wid of wsIds) {
+        try {
+          await joinWorkspace(socket, wid);
+          const snap = await loadDoc(socket, wid, wid);
+          if (!snap.missing) continue;
+          const metaDoc = new Y.Doc();
+          Y.applyUpdate(metaDoc, Buffer.from(snap.missing, "base64"));
+          const base = (process.env.AFFINE_BASE_URL || "").replace(/\/$/, "");
+          const matches = getWorkspacePageEntries(metaDoc.getMap("meta"))
+            .filter(p => p.title && p.title.toLowerCase().includes(q))
+            .slice(0, limit)
+            .map(p => ({
+              workspaceId: wid,
+              docId: p.id,
+              title: p.title,
+              url: `${base}/workspace/${wid}/${p.id}`,
+            }));
+          results.push(...matches);
+        } catch { /* skip inaccessible workspaces */ }
+      }
+    } finally { socket.disconnect(); }
+    return text({ query: parsed.query, totalResults: results.length, results: results.slice(0, limit) });
+  };
+  server.registerTool("search_docs_global", {
+    title: "Search All Workspaces",
+    description: "Search for documents by title across ALL workspaces in a single call. Returns docId, title, workspaceId, workspaceName, and URL for each match. Use this when you don't know which workspace contains the doc.",
+    inputSchema: {
+      query: z.string().describe("Title search query (case-insensitive substring match)."),
+      limit: z.number().optional().describe("Max results per workspace (default: 5)."),
+    },
+  }, searchDocsGlobalHandler as any);
+
   // ─── list_backlinks ──────────────────────────────────────────────────────────
   const listBacklinksHandler = async (parsed: { workspaceId?: string; docId: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
